@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract OmniSyntheticTreasury {
+    struct AssetAccount {
+        uint256 allocatedETH;
+        uint256 lastDepositBlock;
+        bool exists;
+    }
+
+    address payable public immutable treasuryMaster;
+    string public treasuryTag;
+    uint256 public managementFeeBps; // 100 = 1%
+    uint256 public totalVaultCapital;
+    uint256 public accumulatedFees;
+    bool public isEmergencyPaused;
+
+    mapping(bytes32 => bool) public approvedAssets;
+    mapping(address => mapping(bytes32 => AssetAccount)) public accounts;
+
+    event AssetWhitelisted(bytes32 indexed assetKey);
+    event FeeRateUpdated(uint256 newFeeBps);
+    event CapitalDeposited(address indexed user, bytes32 indexed assetKey, uint256 amount);
+    event EmergencyFundsSwept(address indexed master, uint256 amount);
+    event FeesHarvested(address indexed master, uint256 amount);
+    event AssetRebalanced(address indexed user, bytes32 indexed fromAsset, bytes32 indexed toAsset, uint256 amount);
+    event TreasuryTagChanged(string newTag);
+    event CircuitBreakerToggled(bool isPaused);
+    event CapitalWithdrawn(address indexed user, bytes32 indexed assetKey, uint256 amount);
+
+    modifier onlyMaster() {
+        require(msg.sender == treasuryMaster, "OmniTreasury: Unauthorized access");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isEmergencyPaused, "OmniTreasury: Protocol paused");
+        _;
+    }
+
+    constructor() {
+        treasuryMaster = payable(msg.sender);
+        treasuryTag = "Omni Base Multi-Asset Sovereign Vault v1";
+        managementFeeBps = 100; // 1%
+        isEmergencyPaused = false;
+        
+        // По умолчанию активируем базовый ключ WETH
+        approvedAssets[0x5745544800000000000000000000000000000000000000000000000000000000] = true;
+    }
+
+    // 1. addSupportedAsset
+    function addSupportedAsset(bytes32 assetKey) external onlyMaster {
+        require(!approvedAssets[assetKey], "OmniTreasury: Asset already supported");
+        approvedAssets[assetKey] = true;
+        emit AssetWhitelisted(assetKey);
+    }
+
+    // 2. adjustFeeRate
+    function adjustFeeRate(uint256 newFeeBps) external onlyMaster {
+        require(newFeeBps <= 500, "OmniTreasury: Max fee 5%");
+        managementFeeBps = newFeeBps;
+        emit FeeRateUpdated(newFeeBps);
+    }
+
+    // 3. depositCapital
+    function depositCapital(bytes32 assetKey) external payable whenNotPaused {
+        require(approvedAssets[assetKey], "OmniTreasury: Asset not supported");
+        require(msg.value > 0, "OmniTreasury: Deposit must be positive");
+
+        uint256 fee = (msg.value * managementFeeBps) / 10000;
+        uint256 netCapital = msg.value - fee;
+
+        accumulatedFees += fee;
+        totalVaultCapital += netCapital;
+
+        AssetAccount storage acc = accounts[msg.sender][assetKey];
+        acc.allocatedETH += netCapital;
+        acc.lastDepositBlock = block.number;
+        acc.exists = true;
+
+        emit CapitalDeposited(msg.sender, assetKey, netCapital);
+    }
+
+    // 4. emergencySweep
+    function emergencySweep() external onlyMaster {
+        uint256 leftover = address(this).balance > totalVaultCapital ? address(this).balance - totalVaultCapital : 0;
+        if (leftover == 0 && address(this).balance > 0 && totalVaultCapital == 0) {
+            leftover = address(this).balance;
+        }
+        require(leftover > 0, "OmniTreasury: Zero sweep balance");
+
+        (bool sent, ) = treasuryMaster.call{value: leftover}("");
+        require(sent, "OmniTreasury: Sweep failed");
+
+        emit EmergencyFundsSwept(treasuryMaster, leftover);
+    }
+
+    // 5. harvestProtocolFees
+    function harvestProtocolFees() external onlyMaster {
+        uint256 fees = accumulatedFees;
+        require(fees > 0, "OmniTreasury: Zero fees to harvest");
+
+        accumulatedFees = 0;
+        (bool sent, ) = treasuryMaster.call{value: fees}("");
+        require(sent, "OmniTreasury: Harvest failed");
+
+        emit FeesHarvested(treasuryMaster, fees);
+    }
+
+    // 6. rebalanceAssetAllocation
+    function rebalanceAssetAllocation(bytes32 fromAsset, bytes32 toAsset, uint256 amount) external whenNotPaused {
+        require(approvedAssets[fromAsset] && approvedAssets[toAsset], "OmniTreasury: Unsupported asset pair");
+        AssetAccount storage fromAcc = accounts[msg.sender][fromAsset];
+        require(fromAcc.allocatedETH >= amount && amount > 0, "OmniTreasury: Insufficient allocation");
+
+        fromAcc.allocatedETH -= amount;
+        AssetAccount storage toAcc = accounts[msg.sender][toAsset];
+        toAcc.allocatedETH += amount;
+        toAcc.exists = true;
+
+        emit AssetRebalanced(msg.sender, fromAsset, toAsset, amount);
+    }
+
+    // 7. setTreasuryTag
+    function setTreasuryTag(string calldata newTag) external onlyMaster {
+        require(bytes(newTag).length > 0, "OmniTreasury: Empty tag");
+        treasuryTag = newTag;
+        emit TreasuryTagChanged(newTag);
+    }
+
+    // 8. toggleCircuitBreaker
+    function toggleCircuitBreaker(bool isPaused) external onlyMaster {
+        isEmergencyPaused = isPaused;
+        emit CircuitBreakerToggled(isPaused);
+    }
+
+    // 9. withdrawCapital
+    function withdrawCapital(bytes32 assetKey, uint256 amount) external {
+        AssetAccount storage acc = accounts[msg.sender][assetKey];
+        require(acc.allocatedETH >= amount && amount > 0, "OmniTreasury: Insufficient capital");
+
+        acc.allocatedETH -= amount;
+        totalVaultCapital -= amount;
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "OmniTreasury: Payout failed");
+
+        emit CapitalWithdrawn(msg.sender, assetKey, amount);
+    }
+
+    // Чтение баланса
+    function getAssetBalance(address user, bytes32 assetKey) external view returns (uint256 balance, uint256 lastDeposit) {
+        AssetAccount memory acc = accounts[user][assetKey];
+        return (acc.allocatedETH, acc.lastDepositBlock);
+    }
+}
